@@ -2,26 +2,21 @@ name: Build Mecaca EXE
 
 on:
   push:
-    branches: [ "main", "master" ]
 
 jobs:
   build:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
+      - uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Compile all C++ files
-        run: |
+      - run: |
           mkdir build
           cl /EHsc /std:c++17 /Fe:build\Mecaca.exe *.cpp
 
-      - name: Upload EXE
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: Mecaca-exe
           path: build/Mecaca.exe
