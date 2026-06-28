@@ -6677,41 +6677,6 @@ namespace
             post_next();
             return;
         }
-                                  62,
-                                  100,
-                                  job_elapsed_ms(),
-                                      "\"template_points\":" + std::to_string(job->points.size()) +
-                                      ",\"sample_pool_points\":" + std::to_string(job->sample_pool_points) +
-                                      ",\"fill_sample_target\":" + std::to_string(job->fill_sample_target) +
-                                      ",\"detail_sample_target\":" + std::to_string(job->point_target) +
-                                      ",\"coverage_strokes\":" + std::to_string(job->coverage_strokes) +
-                                      ",\"detail_strokes\":" + std::to_string(job->detail_strokes) +
-                                      ",\"basecolor_samples\":" + std::to_string(job->basecolor_samples) +
-                                      ",\"color_source\":\"" + json_escape(job->color_source) + "\"" +
-                                      ",\"albedo_transfer\":\"basecolor_srgb_to_linear_flinearcolor\"" +
-                                      ",\"paint_target_channel\":\"Albedo\"" +
-                                      ",\"material_channel_overwrite\":false" +
-                                      ",\"local_paint_used\":false" +
-                                      ",\"brush_radius_mode\":\"ui_tuning\"" +
-                                      ",\"brush_radius_formula\":\"config.brush_radius\"" +
-                                      ",\"brush_radius_raw\":" + std::to_string(job->brush_radius_raw) +
-                                      ",\"brush_radius\":" + std::to_string(job->brush_radius) +
-                                      ",\"brush_spacing\":" + std::to_string(job->brush_spacing) +
-                                      ",\"server_brush_spacing\":" + std::to_string(job->server_brush_spacing) +
-                                      ",\"two_pass_enabled\":false" +
-                                      ",\"single_pass_enabled\":true" +
-                                      ",\"paint_send_order\":\"single_pass_top_down\"" +
-                                      ",\"server_rpc\":\"ServerPaintBatch\"" +
-                                      ",\"server_batch_limit\":" + std::to_string(job->server_batch_limit) +
-                                      ",\"server_batch_limit_formula\":\"config.server_batch_limit\"" +
-                                      ",\"server_batch_delay_ms\":" + std::to_string(job->server_batch_delay_ms) +
-                                      ",\"server_batch_delay_formula\":\"config.server_batch_delay_ms\"" +
-                                      ",\"server_batch_pacing_profile\":\"ui_tuned\"");
-            job->replicate_index = 0;
-            job->phase = TemplateUvBrushAsyncJob::Phase::ReplicateStrokes;
-            post_next();
-            return;
-        }
         case TemplateUvBrushAsyncJob::Phase::PainterUndercoat:
         {
             // Send all points with dominant color, large brush, in one fast sweep
