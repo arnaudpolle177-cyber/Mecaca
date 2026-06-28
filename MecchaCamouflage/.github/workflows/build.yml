@@ -1,30 +1,27 @@
-name: Build MecchaCamouflage
+name: Build Mecaca EXE
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [ "main" ]
 
 jobs:
   build:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Setup MSBuild
-        uses: microsoft/setup-msbuild@v2
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Build
-        shell: powershell
-        working-directory: MecchaCamouflage
+      - name: Compile all C++ files
         run: |
-          ./scripts/build.ps1
+          mkdir build
+          cl /EHsc /std:c++17 /Fe:build\Mecaca.exe *.cpp
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
-          name: meccha-camouflage
-          path: MecchaCamouflage/.build/bin/*
+          name: Mecaca-exe
+          path: build/Mecaca.exe
