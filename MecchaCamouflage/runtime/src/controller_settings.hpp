@@ -20,6 +20,10 @@ namespace meccha
         double color_humanize{0.0};       // Per-stroke color noise [0..1] (0=off, 1=±3% per channel)
         double spacing_randomize{0.0};    // Spacing variance [0..1] (0=off, 1=±50% spacing)
         bool stroke_smoothing{false};     // Bézier smoothing between adjacent strokes
+        // Painter mode
+        bool painter_mode{false};         // Human painter simulation (undercoat + color-by-color)
+        int think_min_ms{1500};           // Min thinking pause between color groups (ms)
+        int think_max_ms{4000};           // Max thinking pause between color groups (ms)
     };
 
     struct AppSettings
