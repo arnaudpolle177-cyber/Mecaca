@@ -986,6 +986,9 @@ namespace
                ",\"color_humanize\":" + std::to_string(config.tuning.color_humanize) +
                ",\"spacing_randomize\":" + std::to_string(config.tuning.spacing_randomize) +
                ",\"stroke_smoothing\":" + std::string(config.tuning.stroke_smoothing ? "true" : "false") +
+               ",\"painter_mode\":" + std::string(config.tuning.painter_mode ? "true" : "false") +
+               ",\"think_min_ms\":" + std::to_string(config.tuning.think_min_ms) +
+               ",\"think_max_ms\":" + std::to_string(config.tuning.think_max_ms) +
                "}}";
     }
 

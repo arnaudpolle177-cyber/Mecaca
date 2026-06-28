@@ -699,6 +699,57 @@ namespace meccha
                             ImGui::SetTooltip("Random stroke spacing variation (0=off, 1=±50% of spacing). Breaks mechanical regularity.");
                     }
                     ImGui::EndDisabled();
+                    ImGui::Separator();
+                    ImGui::TextDisabled("  Painter Mode");
+                    ImGui::BeginDisabled(!runtime.paint_editing);
+                    // Painter mode toggle
+                    {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::TextUnformatted("Painter mode");
+                        ImGui::TableSetColumnIndex(1);
+                        bool painter = tuning.painter_mode;
+                        if (ImGui::Checkbox("##painter_mode", &painter))
+                        {
+                            tuning.painter_mode = painter;
+                            paint_value_changed = true;
+                        }
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Simulates a human painter: undercoat, then color-by-color with thinking pauses.");
+                    }
+                    // Think min ms
+                    {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::TextUnformatted("Think min (ms)");
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::SetNextItemWidth(-1.0f);
+                        if (ImGui::SliderInt("##think_min_ms", &tuning.think_min_ms, 0, 10000, "%d ms"))
+                        {
+                            if (tuning.think_min_ms > tuning.think_max_ms)
+                                tuning.think_max_ms = tuning.think_min_ms;
+                            paint_value_changed = true;
+                        }
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Minimum thinking pause between color groups (ms).");
+                    }
+                    // Think max ms
+                    {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::TextUnformatted("Think max (ms)");
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::SetNextItemWidth(-1.0f);
+                        if (ImGui::SliderInt("##think_max_ms", &tuning.think_max_ms, 0, 10000, "%d ms"))
+                        {
+                            if (tuning.think_max_ms < tuning.think_min_ms)
+                                tuning.think_min_ms = tuning.think_max_ms;
+                            paint_value_changed = true;
+                        }
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Maximum thinking pause between color groups (ms).");
+                    }
+                    ImGui::EndDisabled();
                     if (runtime.paint_editing && paint_value_changed)
                     {
                         draft.tuning = tuning;

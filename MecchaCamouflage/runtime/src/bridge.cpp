@@ -5335,6 +5335,12 @@ namespace
             Phase0Dense,
             CaptureSource,
             BeginPaint,
+            // Painter mode phases
+            PainterUndercoat,
+            PainterThinkPause,
+            PainterColorGroup,
+            PainterDetailGroup,
+            PainterFinish,
             ReplicateStrokes,
             Finish
         };
@@ -5442,6 +5448,24 @@ namespace
         double tuning_spacing_randomize{0.0};
         bool tuning_stroke_smoothing{false};
         std::uint64_t rng_state{12345678901234567ull};
+        // Painter mode
+        bool tuning_painter_mode{false};
+        int tuning_think_min_ms{1500};
+        int tuning_think_max_ms{4000};
+        // Painter state
+        struct ColorGroup
+        {
+            double r{0.0};
+            double g{0.0};
+            double b{0.0};
+            std::vector<TemplatePoint> points_rough{};  // large brush pass
+            std::vector<TemplatePoint> points_detail{}; // fine brush pass
+        };
+        std::vector<ColorGroup> painter_groups{};
+        int painter_current_group{0};
+        int painter_current_batch{0};
+        bool painter_in_detail_pass{false};
+        std::chrono::steady_clock::time_point painter_think_until{};
         double rgb_min{1.0};
         double rgb_max{0.0};
         double rgb_sum_r{0.0};
@@ -5922,6 +5946,9 @@ namespace
         const double tuning_color_humanize = clamp_range(json_number_field(request, "color_humanize", 0.0), 0.0, 1.0);
         const double tuning_spacing_randomize = clamp_range(json_number_field(request, "spacing_randomize", 0.0), 0.0, 1.0);
         const bool tuning_stroke_smoothing = request.find("\"stroke_smoothing\":true") != std::string::npos;
+        const bool tuning_painter_mode = request.find("\"painter_mode\":true") != std::string::npos;
+        const int tuning_think_min_ms = json_int_field(request, "think_min_ms", 1500, 0, 10000);
+        const int tuning_think_max_ms = std::max(tuning_think_min_ms, json_int_field(request, "think_max_ms", 4000, 0, 10000));
 
         auto job = std::make_shared<TemplateUvBrushAsyncJob>();
         job->queued = queued_job;
@@ -5950,6 +5977,9 @@ namespace
         job->tuning_color_humanize = tuning_color_humanize;
         job->tuning_spacing_randomize = tuning_spacing_randomize;
         job->tuning_stroke_smoothing = tuning_stroke_smoothing;
+        job->tuning_painter_mode = tuning_painter_mode;
+        job->tuning_think_min_ms = tuning_think_min_ms;
+        job->tuning_think_max_ms = tuning_think_max_ms;
         job->rng_state = static_cast<std::uint64_t>(GetTickCount64()) ^ 0xDEADBEEF12345678ull;
         job->brush.Radius = static_cast<float>(job->brush_radius);
         const double visible_probe_width_px = std::max(1.0, static_cast<double>(job->viewport_width) * 0.88);
@@ -6069,6 +6099,155 @@ namespace
         }
         smoothed.push_back(points.back());
         points.swap(smoothed);
+    }
+
+    // --- K-means color clustering for painter mode ---
+    auto painter_color_distance(double r1, double g1, double b1,
+                                 double r2, double g2, double b2) -> double
+    {
+        const double dr = r1 - r2, dg = g1 - g2, db = b1 - b2;
+        return dr*dr + dg*dg + db*db;
+    }
+
+    auto painter_cluster_points(std::vector<TemplateUvBrushAsyncJob::TemplatePoint>& points,
+                                 std::uint64_t& rng,
+                                 int max_clusters = 6)
+        -> std::vector<TemplateUvBrushAsyncJob::ColorGroup>
+    {
+        if (points.empty()) return {};
+
+        // Pick initial centroids by spread (not random, more stable)
+        const int k = std::min(max_clusters, static_cast<int>(points.size()));
+        struct Centroid { double r, g, b; };
+        std::vector<Centroid> centroids(static_cast<std::size_t>(k));
+
+        // First centroid = most common color (just use first point)
+        centroids[0] = {points[0].r, points[0].g, points[0].b};
+        // Remaining: pick point farthest from existing centroids
+        for (int ci = 1; ci < k; ++ci)
+        {
+            double best_dist = -1.0;
+            int best_idx = 0;
+            for (int pi = 0; pi < static_cast<int>(points.size()); ++pi)
+            {
+                double min_dist = 1e18;
+                for (int cj = 0; cj < ci; ++cj)
+                    min_dist = std::min(min_dist, painter_color_distance(
+                        points[static_cast<std::size_t>(pi)].r, points[static_cast<std::size_t>(pi)].g, points[static_cast<std::size_t>(pi)].b,
+                        centroids[static_cast<std::size_t>(cj)].r, centroids[static_cast<std::size_t>(cj)].g, centroids[static_cast<std::size_t>(cj)].b));
+                if (min_dist > best_dist) { best_dist = min_dist; best_idx = pi; }
+            }
+            centroids[static_cast<std::size_t>(ci)] = {points[static_cast<std::size_t>(best_idx)].r,
+                                                        points[static_cast<std::size_t>(best_idx)].g,
+                                                        points[static_cast<std::size_t>(best_idx)].b};
+        }
+
+        // K-means iterations
+        std::vector<int> assignment(points.size(), 0);
+        for (int iter = 0; iter < 8; ++iter)
+        {
+            // Assign
+            for (std::size_t pi = 0; pi < points.size(); ++pi)
+            {
+                double best = 1e18; int best_c = 0;
+                for (int ci = 0; ci < k; ++ci)
+                {
+                    const double d = painter_color_distance(points[pi].r, points[pi].g, points[pi].b,
+                                                             centroids[static_cast<std::size_t>(ci)].r,
+                                                             centroids[static_cast<std::size_t>(ci)].g,
+                                                             centroids[static_cast<std::size_t>(ci)].b);
+                    if (d < best) { best = d; best_c = ci; }
+                }
+                assignment[pi] = best_c;
+            }
+            // Update centroids
+            std::vector<double> sum_r(static_cast<std::size_t>(k), 0), sum_g(static_cast<std::size_t>(k), 0), sum_b(static_cast<std::size_t>(k), 0);
+            std::vector<int> cnt(static_cast<std::size_t>(k), 0);
+            for (std::size_t pi = 0; pi < points.size(); ++pi)
+            {
+                const int ci = assignment[pi];
+                sum_r[static_cast<std::size_t>(ci)] += points[pi].r;
+                sum_g[static_cast<std::size_t>(ci)] += points[pi].g;
+                sum_b[static_cast<std::size_t>(ci)] += points[pi].b;
+                ++cnt[static_cast<std::size_t>(ci)];
+            }
+            for (int ci = 0; ci < k; ++ci)
+            {
+                if (cnt[static_cast<std::size_t>(ci)] > 0)
+                {
+                    centroids[static_cast<std::size_t>(ci)].r = sum_r[static_cast<std::size_t>(ci)] / cnt[static_cast<std::size_t>(ci)];
+                    centroids[static_cast<std::size_t>(ci)].g = sum_g[static_cast<std::size_t>(ci)] / cnt[static_cast<std::size_t>(ci)];
+                    centroids[static_cast<std::size_t>(ci)].b = sum_b[static_cast<std::size_t>(ci)] / cnt[static_cast<std::size_t>(ci)];
+                }
+            }
+        }
+
+        // Build groups, sort by size (largest first = most coverage first)
+        std::vector<TemplateUvBrushAsyncJob::ColorGroup> groups(static_cast<std::size_t>(k));
+        for (int ci = 0; ci < k; ++ci)
+        {
+            groups[static_cast<std::size_t>(ci)].r = centroids[static_cast<std::size_t>(ci)].r;
+            groups[static_cast<std::size_t>(ci)].g = centroids[static_cast<std::size_t>(ci)].g;
+            groups[static_cast<std::size_t>(ci)].b = centroids[static_cast<std::size_t>(ci)].b;
+        }
+        for (std::size_t pi = 0; pi < points.size(); ++pi)
+        {
+            const int ci = assignment[pi];
+            auto pt_rough = points[pi];
+            auto pt_detail = points[pi];
+            // Rough pass: snap to centroid color, large radius
+            pt_rough.r = centroids[static_cast<std::size_t>(ci)].r;
+            pt_rough.g = centroids[static_cast<std::size_t>(ci)].g;
+            pt_rough.b = centroids[static_cast<std::size_t>(ci)].b;
+            pt_rough.stroke_radius = points[pi].stroke_radius * 1.6;
+            // Detail pass: original color, normal radius
+            pt_detail.stroke_radius = points[pi].stroke_radius;
+            groups[static_cast<std::size_t>(ci)].points_rough.push_back(pt_rough);
+            groups[static_cast<std::size_t>(ci)].points_detail.push_back(pt_detail);
+        }
+        // Remove empty groups
+        groups.erase(std::remove_if(groups.begin(), groups.end(),
+            [](const TemplateUvBrushAsyncJob::ColorGroup& g){ return g.points_rough.empty(); }),
+            groups.end());
+        // Sort largest first
+        std::sort(groups.begin(), groups.end(),
+            [](const TemplateUvBrushAsyncJob::ColorGroup& a, const TemplateUvBrushAsyncJob::ColorGroup& b){
+                return a.points_rough.size() > b.points_rough.size();
+            });
+        return groups;
+    }
+
+    // Random think delay between think_min and think_max
+    auto painter_think_delay_ms(const std::shared_ptr<TemplateUvBrushAsyncJob>& job) -> int
+    {
+        if (!job || job->tuning_think_min_ms >= job->tuning_think_max_ms)
+            return job ? job->tuning_think_min_ms : 2000;
+        const double t = (template_rng_signed(job->rng_state) + 1.0) * 0.5; // [0,1]
+        return job->tuning_think_min_ms + static_cast<int>(t * (job->tuning_think_max_ms - job->tuning_think_min_ms));
+    }
+
+    // Send a batch of points and return how many were sent
+    auto painter_send_batch(const std::shared_ptr<TemplateUvBrushAsyncJob>& job,
+                             const std::vector<TemplateUvBrushAsyncJob::TemplatePoint>& pts,
+                             int from, std::string& failure) -> bool
+    {
+        const int count = std::max(1, std::min(job->server_batch_limit,
+                                               static_cast<int>(pts.size()) - from));
+        std::vector<sdk::FPaintStroke> strokes{};
+        strokes.reserve(static_cast<std::size_t>(count));
+        for (int i = 0; i < count; ++i)
+        {
+            const auto& pt = pts[static_cast<std::size_t>(from + i)];
+            auto stroke_brush = job->brush;
+            stroke_brush.Radius = static_cast<float>(pt.stroke_radius > 0.0 ? pt.stroke_radius : job->brush_radius);
+            const auto channel = sdk_make_channel(pt.r, pt.g, pt.b, pt.metallic, pt.roughness,
+                                                   sdk::EPaintChannelApplyMode::Override);
+            strokes.push_back(sdk_make_uv_stroke(pt.u, pt.v, channel, stroke_brush, sdk::EPaintChannel::Albedo));
+        }
+        SdkContext ctx{};
+        ctx.component = job->component;
+        ctx.server_paint_batch_function = job->server_paint_batch_function;
+        return sdk_call_server_paint_batch(ctx, strokes, 0, strokes.size(), failure);
     }
 
     auto tick_template_uv_brush_async_job() -> void
@@ -6476,8 +6655,28 @@ namespace
             job->brush.Spacing = static_cast<float>(job->server_brush_spacing);
             template_configure_server_batch_stream(job, static_cast<int>(job->points.size()));
             job->server_batch_started = std::chrono::steady_clock::now();
-            write_bridge_progress("template_server_batch_begin",
-                                  "template server batch stream prepared",
+            job->replicate_index = 0;
+
+            if (job->tuning_painter_mode)
+            {
+                // Build color groups
+                job->painter_groups = painter_cluster_points(job->points, job->rng_state);
+                job->painter_current_group = 0;
+                job->painter_current_batch = 0;
+                job->painter_in_detail_pass = false;
+                write_bridge_progress("painter_mode_start",
+                                      "Painter mode: undercoat pass starting",
+                                      62, 100, job_elapsed_ms(),
+                                      "\"painter_groups\":" + std::to_string(job->painter_groups.size()));
+                job->phase = TemplateUvBrushAsyncJob::Phase::PainterUndercoat;
+            }
+            else
+            {
+                job->phase = TemplateUvBrushAsyncJob::Phase::ReplicateStrokes;
+            }
+            post_next();
+            return;
+        }
                                   62,
                                   100,
                                   job_elapsed_ms(),
@@ -6511,6 +6710,162 @@ namespace
             job->replicate_index = 0;
             job->phase = TemplateUvBrushAsyncJob::Phase::ReplicateStrokes;
             post_next();
+            return;
+        }
+        case TemplateUvBrushAsyncJob::Phase::PainterUndercoat:
+        {
+            // Send all points with dominant color, large brush, in one fast sweep
+            if (job->painter_current_batch >= static_cast<int>(job->points.size()))
+            {
+                // Undercoat done — think pause then start color groups
+                job->painter_current_group = 0;
+                job->painter_current_batch = 0;
+                job->painter_in_detail_pass = false;
+                const int think = painter_think_delay_ms(job);
+                job->painter_think_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(think);
+                write_bridge_progress("painter_undercoat_done",
+                                      "Undercoat done, thinking...",
+                                      65, 100, job_elapsed_ms(), "");
+                job->phase = TemplateUvBrushAsyncJob::Phase::PainterThinkPause;
+                post_next_after(think);
+                return;
+            }
+            // Build undercoat strokes: dominant centroid color (first group), large brush
+            const int count = std::max(1, std::min(job->server_batch_limit,
+                                                   static_cast<int>(job->points.size()) - job->painter_current_batch));
+            std::vector<sdk::FPaintStroke> strokes{};
+            strokes.reserve(static_cast<std::size_t>(count));
+            const double uc_r = job->painter_groups.empty() ? 0.5 : job->painter_groups[0].r;
+            const double uc_g = job->painter_groups.empty() ? 0.5 : job->painter_groups[0].g;
+            const double uc_b = job->painter_groups.empty() ? 0.5 : job->painter_groups[0].b;
+            for (int i = 0; i < count; ++i)
+            {
+                const auto& pt = job->points[static_cast<std::size_t>(job->painter_current_batch + i)];
+                auto stroke_brush = job->brush;
+                stroke_brush.Radius = static_cast<float>(job->brush_radius * 2.0); // large undercoat brush
+                stroke_brush.Spacing = static_cast<float>(job->server_brush_spacing * 2.0); // sparse
+                const auto channel = sdk_make_channel(uc_r, uc_g, uc_b, pt.metallic, pt.roughness,
+                                                       sdk::EPaintChannelApplyMode::Override);
+                strokes.push_back(sdk_make_uv_stroke(pt.u, pt.v, channel, stroke_brush, sdk::EPaintChannel::Albedo));
+            }
+            SdkContext ctx{};
+            ctx.component = job->component;
+            ctx.server_paint_batch_function = job->server_paint_batch_function;
+            std::string failure{};
+            if (!sdk_call_server_paint_batch(ctx, strokes, 0, strokes.size(), failure))
+            {
+                fail_job("painter_undercoat_failed", "Undercoat batch failed: " + failure);
+                return;
+            }
+            job->server_strokes_sent += count;
+            job->painter_current_batch += count;
+            post_next_after(job->server_batch_delay_ms);
+            return;
+        }
+        case TemplateUvBrushAsyncJob::Phase::PainterThinkPause:
+        {
+            const auto now = std::chrono::steady_clock::now();
+            if (now < job->painter_think_until)
+            {
+                const int remaining = static_cast<int>(std::chrono::duration<double, std::milli>(
+                    job->painter_think_until - now).count());
+                post_next_after(std::max(1, remaining));
+                return;
+            }
+            // Think done — go to next phase depending on where we are
+            if (job->painter_in_detail_pass)
+                job->phase = TemplateUvBrushAsyncJob::Phase::PainterDetailGroup;
+            else
+                job->phase = TemplateUvBrushAsyncJob::Phase::PainterColorGroup;
+            job->painter_current_batch = 0;
+            post_next();
+            return;
+        }
+        case TemplateUvBrushAsyncJob::Phase::PainterColorGroup:
+        {
+            // Paint current group rough pass
+            if (job->painter_current_group >= static_cast<int>(job->painter_groups.size()))
+            {
+                // All rough passes done — now detail passes
+                job->painter_current_group = 0;
+                job->painter_current_batch = 0;
+                const int think = painter_think_delay_ms(job);
+                job->painter_think_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(think);
+                write_bridge_progress("painter_rough_done",
+                                      "Rough pass done, starting detail pass...",
+                                      85, 100, job_elapsed_ms(), "");
+                job->phase = TemplateUvBrushAsyncJob::Phase::PainterThinkPause;
+                // After think, go to detail
+                job->painter_in_detail_pass = true;
+                post_next_after(think);
+                return;
+            }
+            auto& group = job->painter_groups[static_cast<std::size_t>(job->painter_current_group)];
+            const auto& pts = group.points_rough;
+            if (job->painter_current_batch >= static_cast<int>(pts.size()))
+            {
+                // Done with this group — think and move to next
+                ++job->painter_current_group;
+                job->painter_current_batch = 0;
+                const int think = painter_think_delay_ms(job);
+                job->painter_think_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(think);
+                const int pct = 65 + static_cast<int>((static_cast<double>(job->painter_current_group) /
+                                 std::max(1.0, static_cast<double>(job->painter_groups.size()))) * 20.0);
+                write_bridge_progress("painter_group_done",
+                                      "Color group done, thinking...",
+                                      pct, 100, job_elapsed_ms(),
+                                      "\"group\":" + std::to_string(job->painter_current_group - 1) +
+                                      ",\"groups\":" + std::to_string(job->painter_groups.size()));
+                job->phase = TemplateUvBrushAsyncJob::Phase::PainterThinkPause;
+                post_next_after(think);
+                return;
+            }
+            std::string failure{};
+            if (!painter_send_batch(job, pts, job->painter_current_batch, failure))
+            {
+                fail_job("painter_color_group_failed", "Color group batch failed: " + failure);
+                return;
+            }
+            const int count = std::max(1, std::min(job->server_batch_limit,
+                                                   static_cast<int>(pts.size()) - job->painter_current_batch));
+            job->server_strokes_sent += count;
+            job->painter_current_batch += count;
+            post_next_after(job->server_batch_delay_ms);
+            return;
+        }
+        case TemplateUvBrushAsyncJob::Phase::PainterDetailGroup:
+        {
+            // Paint current group detail pass
+            if (job->painter_current_group >= static_cast<int>(job->painter_groups.size()))
+            {
+                // All detail passes done
+                job->phase = TemplateUvBrushAsyncJob::Phase::Finish;
+                post_next();
+                return;
+            }
+            auto& group = job->painter_groups[static_cast<std::size_t>(job->painter_current_group)];
+            const auto& pts = group.points_detail;
+            if (job->painter_current_batch >= static_cast<int>(pts.size()))
+            {
+                ++job->painter_current_group;
+                job->painter_current_batch = 0;
+                const int think = painter_think_delay_ms(job);
+                job->painter_think_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(think);
+                job->phase = TemplateUvBrushAsyncJob::Phase::PainterThinkPause;
+                post_next_after(think);
+                return;
+            }
+            std::string failure{};
+            if (!painter_send_batch(job, pts, job->painter_current_batch, failure))
+            {
+                fail_job("painter_detail_group_failed", "Detail group batch failed: " + failure);
+                return;
+            }
+            const int count = std::max(1, std::min(job->server_batch_limit,
+                                                   static_cast<int>(pts.size()) - job->painter_current_batch));
+            job->server_strokes_sent += count;
+            job->painter_current_batch += count;
+            post_next_after(job->server_batch_delay_ms);
             return;
         }
         case TemplateUvBrushAsyncJob::Phase::ReplicateStrokes:

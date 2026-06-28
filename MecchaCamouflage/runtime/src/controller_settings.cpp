@@ -191,6 +191,8 @@ namespace meccha
         settings.tuning.pressure_randomize = clamp_double(settings.tuning.pressure_randomize, 0.0, 1.0);
         settings.tuning.color_humanize = clamp_double(settings.tuning.color_humanize, 0.0, 1.0);
         settings.tuning.spacing_randomize = clamp_double(settings.tuning.spacing_randomize, 0.0, 1.0);
+        settings.tuning.think_min_ms = std::max(0, std::min(10000, settings.tuning.think_min_ms));
+        settings.tuning.think_max_ms = std::max(settings.tuning.think_min_ms, std::min(10000, settings.tuning.think_max_ms));
         if (settings.paint_hotkey.empty())
             settings.paint_hotkey = "F10";
     }
@@ -225,6 +227,9 @@ namespace meccha
             settings.tuning.color_humanize = extract_json_number(text, "color_humanize", settings.tuning.color_humanize);
             settings.tuning.spacing_randomize = extract_json_number(text, "spacing_randomize", settings.tuning.spacing_randomize);
             settings.tuning.stroke_smoothing = extract_json_bool(text, "stroke_smoothing", settings.tuning.stroke_smoothing);
+            settings.tuning.painter_mode = extract_json_bool(text, "painter_mode", settings.tuning.painter_mode);
+            settings.tuning.think_min_ms = static_cast<int>(extract_json_number(text, "think_min_ms", settings.tuning.think_min_ms));
+            settings.tuning.think_max_ms = static_cast<int>(extract_json_number(text, "think_max_ms", settings.tuning.think_max_ms));
         }
         clamp_settings(settings);
         return settings;
@@ -253,7 +258,10 @@ namespace meccha
             "  \"pressure_randomize\": " + std::to_string(settings.tuning.pressure_randomize) + ",\n" +
             "  \"color_humanize\": " + std::to_string(settings.tuning.color_humanize) + ",\n" +
             "  \"spacing_randomize\": " + std::to_string(settings.tuning.spacing_randomize) + ",\n" +
-            "  \"stroke_smoothing\": " + std::string(settings.tuning.stroke_smoothing ? "true" : "false") + "\n" +
+            "  \"stroke_smoothing\": " + std::string(settings.tuning.stroke_smoothing ? "true" : "false") + ",\n" +
+            "  \"painter_mode\": " + std::string(settings.tuning.painter_mode ? "true" : "false") + ",\n" +
+            "  \"think_min_ms\": " + std::to_string(settings.tuning.think_min_ms) + ",\n" +
+            "  \"think_max_ms\": " + std::to_string(settings.tuning.think_max_ms) + "\n" +
             "}\n";
         const auto path = config_path();
         const auto tmp = std::filesystem::path(path.wstring() + L".tmp");
