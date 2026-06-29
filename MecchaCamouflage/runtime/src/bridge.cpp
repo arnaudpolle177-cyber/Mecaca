@@ -5334,7 +5334,9 @@ namespace
             Phase0BaseGrid,
             Phase0Dense,
             CaptureSource,
+            BuildStrokePaths,  // Convert points to connected stroke paths
             BeginPaint,
+            StrokePathSend,   // vector stroke-by-stroke sending
             // Painter mode phases
             PainterUndercoat,
             PainterThinkPause,
@@ -5460,12 +5462,22 @@ namespace
             double b{0.0};
             std::vector<TemplatePoint> points_rough{};  // large brush pass
             std::vector<TemplatePoint> points_detail{}; // fine brush pass
+            // Vector paths (built from points)
+            std::vector<std::vector<TemplatePoint>> paths_rough{};
+            std::vector<std::vector<TemplatePoint>> paths_detail{};
         };
         std::vector<ColorGroup> painter_groups{};
         int painter_current_group{0};
-        int painter_current_batch{0};
+        int painter_current_path{0};   // current path within group
+        int painter_current_batch{0};  // current point within path
         bool painter_in_detail_pass{false};
         std::chrono::steady_clock::time_point painter_think_until{};
+        // Vector stroke paths (for non-painter mode)
+        std::vector<std::vector<TemplatePoint>> stroke_paths{};
+        int stroke_path_index{0};
+        int stroke_point_index{0};
+        int inter_stroke_delay_ms{30};   // 30ms between points in same continuous stroke = fluid line
+        int lift_pen_delay_ms{250};      // 250ms between different strokes in same color = reposition
         double rgb_min{1.0};
         double rgb_max{0.0};
         double rgb_sum_r{0.0};
@@ -5738,6 +5750,96 @@ namespace
     {
         if (a.y == b.y) return a.x < b.x;
         return a.y < b.y;
+    }
+
+    // --- Vector path builder ---
+    // Groups points into chains (strokes) by nearest-neighbor proximity.
+    // Each chain = one continuous brush stroke like a human would make.
+    // max_gap_uv: if next nearest point is farther than this in UV space, start a new stroke.
+    auto painter_build_stroke_paths(
+        std::vector<TemplateUvBrushAsyncJob::TemplatePoint>& points,
+        double max_gap_uv) -> std::vector<std::vector<TemplateUvBrushAsyncJob::TemplatePoint>>
+    {
+        using PT = TemplateUvBrushAsyncJob::TemplatePoint;
+        std::vector<std::vector<PT>> paths;
+        if (points.empty()) return paths;
+
+        const std::size_t n = points.size();
+        std::vector<bool> used(n, false);
+
+        // Simple spatial grid for fast nearest-neighbor lookup
+        const int grid_size = std::max(1, static_cast<int>(std::sqrt(static_cast<double>(n) / 4.0)));
+        const double cell = 1.0 / static_cast<double>(grid_size);
+        std::vector<std::vector<std::size_t>> grid(static_cast<std::size_t>(grid_size * grid_size));
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const int gu = std::max(0, std::min(grid_size - 1, static_cast<int>(points[i].u / cell)));
+            const int gv = std::max(0, std::min(grid_size - 1, static_cast<int>(points[i].v / cell)));
+            grid[static_cast<std::size_t>(gv * grid_size + gu)].push_back(i);
+        }
+
+        auto nearest_unused = [&](double u, double v, std::size_t exclude) -> std::size_t
+        {
+            double best_d = max_gap_uv * max_gap_uv * 4.0;
+            std::size_t best_i = n; // n = not found
+            const int search_radius = std::max(1, static_cast<int>(std::ceil(max_gap_uv / cell)) + 1);
+            const int gu0 = std::max(0, std::min(grid_size - 1, static_cast<int>(u / cell)));
+            const int gv0 = std::max(0, std::min(grid_size - 1, static_cast<int>(v / cell)));
+            for (int dv = -search_radius; dv <= search_radius; ++dv)
+            {
+                for (int du = -search_radius; du <= search_radius; ++du)
+                {
+                    const int gu = gu0 + du, gv = gv0 + dv;
+                    if (gu < 0 || gv < 0 || gu >= grid_size || gv >= grid_size) continue;
+                    for (const auto idx : grid[static_cast<std::size_t>(gv * grid_size + gu)])
+                    {
+                        if (used[idx] || idx == exclude) continue;
+                        const double du2 = points[idx].u - u;
+                        const double dv2 = points[idx].v - v;
+                        const double d = du2*du2 + dv2*dv2;
+                        if (d < best_d) { best_d = d; best_i = idx; }
+                    }
+                }
+            }
+            return best_d <= max_gap_uv * max_gap_uv ? best_i : n;
+        };
+
+        // Find longest unused chain starting from each unvisited point
+        for (std::size_t start = 0; start < n; ++start)
+        {
+            if (used[start]) continue;
+            std::vector<PT> path;
+            std::size_t cur = start;
+            used[cur] = true;
+            path.push_back(points[cur]);
+            while (true)
+            {
+                const std::size_t next = nearest_unused(points[cur].u, points[cur].v, cur);
+                if (next == n) break;
+                used[next] = true;
+                path.push_back(points[next]);
+                cur = next;
+            }
+            paths.push_back(std::move(path));
+        }
+
+        // Sort paths: longest first (big shapes before details)
+        std::sort(paths.begin(), paths.end(),
+            [](const std::vector<PT>& a, const std::vector<PT>& b){ return a.size() > b.size(); });
+
+        return paths;
+    }
+
+    // Flatten paths back to point list preserving stroke order
+    auto painter_flatten_paths(
+        const std::vector<std::vector<TemplateUvBrushAsyncJob::TemplatePoint>>& paths)
+        -> std::vector<TemplateUvBrushAsyncJob::TemplatePoint>
+    {
+        std::vector<TemplateUvBrushAsyncJob::TemplatePoint> out;
+        for (const auto& path : paths)
+            for (const auto& pt : path)
+                out.push_back(pt);
+        return out;
     }
 
     auto template_select_uniform_yx(std::vector<TemplateUvBrushAsyncJob::TemplatePoint> source,
@@ -6030,6 +6132,112 @@ namespace
         return true;
     }
 
+    // --- Vector-based stroke path generation ---
+    // Distance in UV space
+    auto uv_distance(double u1, double v1, double u2, double v2) -> double
+    {
+        const double du = u1 - u2, dv = v1 - v2;
+        return std::sqrt(du*du + dv*dv);
+    }
+
+    // Build connected paths from points using nearest-neighbor
+    // Returns list of paths (sequences of connected points)
+    auto build_stroke_paths(std::vector<TemplateUvBrushAsyncJob::TemplatePoint> points,
+                            double max_segment_distance = 0.05) // max UV distance before path breaks
+        -> std::vector<std::vector<TemplateUvBrushAsyncJob::TemplatePoint>>
+    {
+        if (points.empty()) return {};
+
+        std::vector<std::vector<TemplateUvBrushAsyncJob::TemplatePoint>> paths;
+        std::vector<bool> used(points.size(), false);
+
+        // Greedy nearest-neighbor path building
+        for (std::size_t start = 0; start < points.size(); ++start)
+        {
+            if (used[start]) continue;
+
+            std::vector<TemplateUvBrushAsyncJob::TemplatePoint> path;
+            int current = static_cast<int>(start);
+            used[current] = true;
+            path.push_back(points[static_cast<std::size_t>(current)]);
+
+            // Extend path by finding nearest unvisited neighbor
+            while (true)
+            {
+                double best_dist = max_segment_distance + 0.001;
+                int best_next = -1;
+
+                for (int i = 0; i < static_cast<int>(points.size()); ++i)
+                {
+                    if (used[i]) continue;
+                    const double d = uv_distance(points[static_cast<std::size_t>(current)].u,
+                                                 points[static_cast<std::size_t>(current)].v,
+                                                 points[static_cast<std::size_t>(i)].u,
+                                                 points[static_cast<std::size_t>(i)].v);
+                    if (d < best_dist)
+                    {
+                        best_dist = d;
+                        best_next = i;
+                    }
+                }
+
+                if (best_next < 0) break; // No more neighbors, path ends
+
+                used[static_cast<std::size_t>(best_next)] = true;
+                path.push_back(points[static_cast<std::size_t>(best_next)]);
+                current = best_next;
+            }
+
+            if (path.size() >= 1)
+                paths.push_back(path);
+        }
+
+        return paths;
+    }
+
+    // Sort paths by size (largest first = contours/edges first, then fills)
+    auto sort_paths_by_size(std::vector<std::vector<TemplateUvBrushAsyncJob::TemplatePoint>>& paths) -> void
+    {
+        std::sort(paths.begin(), paths.end(),
+            [](const auto& a, const auto& b) { return a.size() > b.size(); });
+    }
+
+    // Detect edge points (points near color boundaries) — these become priority strokes
+    auto detect_edge_points(const std::vector<TemplateUvBrushAsyncJob::TemplatePoint>& points,
+                            double color_threshold = 0.1) -> std::vector<bool>
+    {
+        std::vector<bool> is_edge(points.size(), false);
+
+        for (std::size_t i = 0; i < points.size(); ++i)
+        {
+            const auto& p = points[i];
+            bool has_different_neighbor = false;
+
+            for (std::size_t j = 0; j < points.size(); ++j)
+            {
+                if (i == j) continue;
+                const auto& q = points[j];
+                const double d = uv_distance(p.u, p.v, q.u, q.v);
+
+                // If close neighbor has different color, this is an edge
+                if (d < 0.06)
+                {
+                    const double dr = p.r - q.r, dg = p.g - q.g, db = p.b - q.b;
+                    const double color_dist = std::sqrt(dr*dr + dg*dg + db*db);
+                    if (color_dist > color_threshold)
+                    {
+                        has_different_neighbor = true;
+                        break;
+                    }
+                }
+            }
+
+            is_edge[i] = has_different_neighbor;
+        }
+
+        return is_edge;
+    }
+
     auto template_xorshift64(std::uint64_t& state) -> std::uint64_t
     {
         state ^= state << 13;
@@ -6214,6 +6422,14 @@ namespace
             [](const TemplateUvBrushAsyncJob::ColorGroup& a, const TemplateUvBrushAsyncJob::ColorGroup& b){
                 return a.points_rough.size() > b.points_rough.size();
             });
+        // Build vector stroke paths for each group
+        // max_gap_uv: ~3x brush radius in UV space feels natural
+        const double max_gap_uv = 0.06;
+        for (auto& group : groups)
+        {
+            group.paths_rough = painter_build_stroke_paths(group.points_rough, max_gap_uv * 1.8);
+            group.paths_detail = painter_build_stroke_paths(group.points_detail, max_gap_uv);
+        }
         return groups;
     }
 
@@ -6226,7 +6442,25 @@ namespace
         return job->tuning_think_min_ms + static_cast<int>(t * (job->tuning_think_max_ms - job->tuning_think_min_ms));
     }
 
-    // Send a batch of points and return how many were sent
+    // Send a single stroke point (one mouse move)
+    auto painter_send_point(const std::shared_ptr<TemplateUvBrushAsyncJob>& job,
+                            const TemplateUvBrushAsyncJob::TemplatePoint& pt,
+                            std::string& failure) -> bool
+    {
+        auto stroke_brush = job->brush;
+        stroke_brush.Radius = static_cast<float>(pt.stroke_radius > 0.0 ? pt.stroke_radius : job->brush_radius);
+        const auto channel = sdk_make_channel(pt.r, pt.g, pt.b, pt.metallic, pt.roughness,
+                                               sdk::EPaintChannelApplyMode::Override);
+        const std::vector<sdk::FPaintStroke> strokes{
+            sdk_make_uv_stroke(pt.u, pt.v, channel, stroke_brush, sdk::EPaintChannel::Albedo)
+        };
+        SdkContext ctx{};
+        ctx.component = job->component;
+        ctx.server_paint_batch_function = job->server_paint_batch_function;
+        return sdk_call_server_paint_batch(ctx, strokes, 0, 1, failure);
+    }
+
+    // Send a batch of points (used for undercoat — fast)
     auto painter_send_batch(const std::shared_ptr<TemplateUvBrushAsyncJob>& job,
                              const std::vector<TemplateUvBrushAsyncJob::TemplatePoint>& pts,
                              int from, std::string& failure) -> bool
@@ -6626,8 +6860,29 @@ namespace
                                       ",\"coverage_strokes\":" + std::to_string(job->coverage_strokes) +
                                       ",\"detail_strokes\":" + std::to_string(job->detail_strokes) +
                                       ",\"bulk_backend\":\"" + json_escape(capture.bulk_backend) + "\"");
-            job->phase = TemplateUvBrushAsyncJob::Phase::BeginPaint;
+            job->phase = TemplateUvBrushAsyncJob::Phase::BuildStrokePaths;
             job->progress_percent = -1;
+            post_next();
+            return;
+        }
+        case TemplateUvBrushAsyncJob::Phase::BuildStrokePaths:
+        {
+            // Convert flat point list into connected stroke paths
+            // This makes painting look like human brush strokes instead of scanner lines
+            const double max_gap_uv = job->brush_radius * 3.0;
+            job->stroke_paths = painter_build_stroke_paths(job->points, max_gap_uv);
+            job->stroke_path_index = 0;
+            job->stroke_point_index = 0;
+            job->inter_stroke_delay_ms = 30;  // Fast: 30ms between points = continuous fluid stroke
+            job->lift_pen_delay_ms = 250;     // Pause when lifting pen between strokes
+
+            write_bridge_progress("stroke_paths_built",
+                                  "Vector stroke paths built - ready to paint",
+                                  60, 100, job_elapsed_ms(),
+                                  "\"stroke_paths\":" + std::to_string(job->stroke_paths.size()) +
+                                  ",\"total_points\":" + std::to_string(job->points.size()));
+
+            job->phase = TemplateUvBrushAsyncJob::Phase::BeginPaint;
             post_next();
             return;
         }
@@ -6638,11 +6893,6 @@ namespace
             {
                 fail_job("template_points_unavailable", "template route produced no direct template points");
                 return;
-            }
-            // Apply Bézier smoothing before sending
-            if (job->tuning_stroke_smoothing)
-            {
-                template_smooth_points_bezier(job->points);
             }
             // Apply per-point humanization (jitter, pressure, color noise)
             if (job->tuning_jitter > 0.0 || job->tuning_pressure_randomize > 0.0 || job->tuning_color_humanize > 0.0)
@@ -6659,7 +6909,7 @@ namespace
 
             if (job->tuning_painter_mode)
             {
-                // Build color groups
+                // Build color groups for painter mode
                 job->painter_groups = painter_cluster_points(job->points, job->rng_state);
                 job->painter_current_group = 0;
                 job->painter_current_batch = 0;
@@ -6672,9 +6922,122 @@ namespace
             }
             else
             {
-                job->phase = TemplateUvBrushAsyncJob::Phase::ReplicateStrokes;
+                // Vector stroke paths already built in BuildStrokePaths phase
+                write_bridge_progress("begin_paint_vector_mode",
+                                      "Painting with natural brush strokes",
+                                      62, 100, job_elapsed_ms(),
+                                      "\"stroke_paths\":" + std::to_string(job->stroke_paths.size()));
+                job->phase = TemplateUvBrushAsyncJob::Phase::StrokePathSend;
             }
             post_next();
+            return;
+        }
+        case TemplateUvBrushAsyncJob::Phase::StrokePathSend:
+        {
+            // Send one point at a time from current stroke path
+            // Between points in same path: inter_stroke_delay_ms (mouse moving)
+            // Between paths: lift_pen_delay_ms (pen lifted)
+
+            const auto now = std::chrono::steady_clock::now();
+            if (job->server_next_batch_time.time_since_epoch().count() != 0 &&
+                now < job->server_next_batch_time)
+            {
+                const int remaining_ms = std::max(1, static_cast<int>(std::ceil(
+                    std::chrono::duration<double, std::milli>(job->server_next_batch_time - now).count())));
+                post_next_after(remaining_ms);
+                return;
+            }
+            job->server_next_batch_time = {};
+
+            if (job->stroke_path_index >= static_cast<int>(job->stroke_paths.size()))
+            {
+                // All paths done
+                job->replication_after_explicit_batches = capture_replication_snapshot();
+                job->phase = TemplateUvBrushAsyncJob::Phase::Finish;
+                post_next();
+                return;
+            }
+
+            const auto& current_path = job->stroke_paths[static_cast<std::size_t>(job->stroke_path_index)];
+            const bool path_done = job->stroke_point_index >= static_cast<int>(current_path.size());
+
+            if (path_done)
+            {
+                // Move to next path — lift pen pause
+                ++job->stroke_path_index;
+                job->stroke_point_index = 0;
+                int lift_delay = job->lift_pen_delay_ms;
+                if (job->tuning_spacing_randomize > 0.0)
+                {
+                    const double var = job->tuning_spacing_randomize * 0.5;
+                    const double f = 1.0 + template_rng_signed(job->rng_state) * var;
+                    lift_delay = std::max(50, static_cast<int>(lift_delay * f));
+                }
+                const int pct = 62 + static_cast<int>(
+                    (static_cast<double>(job->stroke_path_index) /
+                     std::max(1.0, static_cast<double>(job->stroke_paths.size()))) * 37.0);
+                if (pct != job->progress_percent)
+                {
+                    job->progress_percent = pct;
+                    write_bridge_progress("stroke_path_send",
+                                          "Painting stroke paths",
+                                          pct, 100, job_elapsed_ms(),
+                                          "\"path\":" + std::to_string(job->stroke_path_index) +
+                                          ",\"paths\":" + std::to_string(job->stroke_paths.size()) +
+                                          ",\"strokes_sent\":" + std::to_string(job->server_strokes_sent));
+                }
+                job->server_next_batch_time = std::chrono::steady_clock::now() +
+                                              std::chrono::milliseconds(lift_delay);
+                post_next_after(lift_delay);
+                return;
+            }
+
+            // Send one point (or a small batch if points are close together)
+            const int max_in_one_go = std::max(1, std::min(job->server_batch_limit,
+                                               static_cast<int>(current_path.size()) - job->stroke_point_index));
+            // Only send 1 point per tick to simulate mouse movement,
+            // but allow up to batch_limit if stroke is very long
+            const int send_count = std::min(max_in_one_go, std::max(1, job->server_batch_limit / 4));
+
+            std::vector<sdk::FPaintStroke> strokes{};
+            strokes.reserve(static_cast<std::size_t>(send_count));
+            for (int i = 0; i < send_count; ++i)
+            {
+                const auto& pt = current_path[static_cast<std::size_t>(job->stroke_point_index + i)];
+                auto stroke_brush = job->brush;
+                stroke_brush.Radius = static_cast<float>(pt.stroke_radius > 0.0 ? pt.stroke_radius : job->brush_radius);
+                const auto channel = sdk_make_channel(pt.r, pt.g, pt.b, pt.metallic, pt.roughness,
+                                                       sdk::EPaintChannelApplyMode::Override);
+                strokes.push_back(sdk_make_uv_stroke(pt.u, pt.v, channel, stroke_brush, sdk::EPaintChannel::Albedo));
+            }
+
+            SdkContext ctx{};
+            ctx.component = job->component;
+            ctx.server_paint_batch_function = job->server_paint_batch_function;
+            std::string failure{};
+            if (!sdk_call_server_paint_batch(ctx, strokes, 0, strokes.size(), failure))
+            {
+                ++job->server_batch_failures;
+                if (job->first_failure.empty()) job->first_failure = failure;
+                fail_job("stroke_path_send_failed", "StrokePathSend failed: " + failure);
+                return;
+            }
+
+            job->server_strokes_sent += send_count;
+            job->stroke_point_index += send_count;
+            ++job->server_batch_calls;
+
+            // Delay between points: simulate mouse speed
+            int point_delay = job->inter_stroke_delay_ms;
+            if (job->tuning_spacing_randomize > 0.0)
+            {
+                const double var = job->tuning_spacing_randomize * 0.4;
+                const double f = 1.0 + template_rng_signed(job->rng_state) * var;
+                point_delay = std::max(10, static_cast<int>(point_delay * f));
+            }
+            job->server_next_batch_time = std::chrono::steady_clock::now() +
+                                          std::chrono::milliseconds(point_delay);
+            post_next_after(point_delay);
             return;
         }
         case TemplateUvBrushAsyncJob::Phase::PainterUndercoat:
@@ -6748,36 +7111,36 @@ namespace
         }
         case TemplateUvBrushAsyncJob::Phase::PainterColorGroup:
         {
-            // Paint current group rough pass
             if (job->painter_current_group >= static_cast<int>(job->painter_groups.size()))
             {
-                // All rough passes done — now detail passes
+                // All rough passes done — think then go to detail
                 job->painter_current_group = 0;
+                job->painter_current_path = 0;
                 job->painter_current_batch = 0;
                 const int think = painter_think_delay_ms(job);
                 job->painter_think_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(think);
                 write_bridge_progress("painter_rough_done",
                                       "Rough pass done, starting detail pass...",
                                       85, 100, job_elapsed_ms(), "");
-                job->phase = TemplateUvBrushAsyncJob::Phase::PainterThinkPause;
-                // After think, go to detail
                 job->painter_in_detail_pass = true;
+                job->phase = TemplateUvBrushAsyncJob::Phase::PainterThinkPause;
                 post_next_after(think);
                 return;
             }
             auto& group = job->painter_groups[static_cast<std::size_t>(job->painter_current_group)];
-            const auto& pts = group.points_rough;
-            if (job->painter_current_batch >= static_cast<int>(pts.size()))
+            const auto& paths = group.paths_rough;
+
+            if (job->painter_current_path >= static_cast<int>(paths.size()))
             {
-                // Done with this group — think and move to next
+                // Done with this color group — think and move to next
                 ++job->painter_current_group;
+                job->painter_current_path = 0;
                 job->painter_current_batch = 0;
                 const int think = painter_think_delay_ms(job);
                 job->painter_think_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(think);
                 const int pct = 65 + static_cast<int>((static_cast<double>(job->painter_current_group) /
                                  std::max(1.0, static_cast<double>(job->painter_groups.size()))) * 20.0);
-                write_bridge_progress("painter_group_done",
-                                      "Color group done, thinking...",
+                write_bridge_progress("painter_group_done", "Color group done, thinking...",
                                       pct, 100, job_elapsed_ms(),
                                       "\"group\":" + std::to_string(job->painter_current_group - 1) +
                                       ",\"groups\":" + std::to_string(job->painter_groups.size()));
@@ -6785,17 +7148,35 @@ namespace
                 post_next_after(think);
                 return;
             }
-            std::string failure{};
-            if (!painter_send_batch(job, pts, job->painter_current_batch, failure))
+
+            const auto& current_path = paths[static_cast<std::size_t>(job->painter_current_path)];
+
+            if (job->painter_current_batch >= static_cast<int>(current_path.size()))
             {
-                fail_job("painter_color_group_failed", "Color group batch failed: " + failure);
+                // End of this stroke path — lift pen, move to next path
+                ++job->painter_current_path;
+                job->painter_current_batch = 0;
+                // Lift-pen delay: random between server_batch_delay and 2x
+                const int lift = job->server_batch_delay_ms +
+                    static_cast<int>((template_rng_signed(job->rng_state) + 1.0) * 0.5 * job->server_batch_delay_ms);
+                post_next_after(lift);
                 return;
             }
-            const int count = std::max(1, std::min(job->server_batch_limit,
-                                                   static_cast<int>(pts.size()) - job->painter_current_batch));
-            job->server_strokes_sent += count;
-            job->painter_current_batch += count;
-            post_next_after(job->server_batch_delay_ms);
+
+            // Send one point (one mouse move in the stroke)
+            const auto& pt = current_path[static_cast<std::size_t>(job->painter_current_batch)];
+            std::string failure{};
+            if (!painter_send_point(job, pt, failure))
+            {
+                fail_job("painter_color_group_failed", "Color group stroke failed: " + failure);
+                return;
+            }
+            ++job->server_strokes_sent;
+            ++job->painter_current_batch;
+            // Inter-point delay within same stroke: fast like mouse movement
+            const int pt_delay = job->inter_stroke_delay_ms +
+                static_cast<int>((template_rng_signed(job->rng_state) + 1.0) * 0.5 * (job->inter_stroke_delay_ms / 2));
+            post_next_after(pt_delay);
             return;
         }
         case TemplateUvBrushAsyncJob::Phase::PainterDetailGroup:
