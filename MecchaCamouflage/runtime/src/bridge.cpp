@@ -7062,26 +7062,25 @@ namespace
         }
         case TemplateUvBrushAsyncJob::Phase::PainterUndercoat:
         {
-            // Undercoat: fast background pass to cover entire model in 2 seconds
-            // Uses HUGE brush (4x normal), ultra-fast timing, dominant color
+            // Undercoat: smooth fluid strokes with HUGE brush (6x normal)
+            // Goal: 2-3 seconds, continuous strokes not scanner mode
             
-            if (job->painter_current_batch >= static_cast<int>(job->points.size()))
+            if (job->stroke_path_index >= static_cast<int>(job->stroke_paths.size()))
             {
                 // Undercoat done — build color groups immediately (no lag)
                 job->painter_groups = painter_cluster_points(job->points, job->rng_state);
                 
-                // Pre-calculate stroke paths and LARGE dynamic brush for each group
+                // Pre-calculate stroke paths for each group
                 for (auto& group : job->painter_groups)
                 {
-                    const double max_gap_uv = job->brush_radius * 3.0;
-                    group.paths_rough = painter_build_stroke_paths(group.points_rough, max_gap_uv * 1.8);
-                    group.paths_detail = painter_build_stroke_paths(group.points_detail, max_gap_uv);
+                    const double max_gap_uv = job->brush_radius * 2.5;
+                    group.paths_rough = painter_build_stroke_paths(group.points_rough, max_gap_uv);
+                    group.paths_detail = painter_build_stroke_paths(group.points_detail, max_gap_uv * 0.8);
                     
-                    // Dynamic brush: LARGE for rough pass
+                    // Dynamic brush: VERY LARGE for rough pass
                     const int point_count = static_cast<int>(group.points_rough.size());
-                    const double area_coverage = std::sqrt(point_count) * job->brush_radius;
-                    // BIG: 1.5x to 4x depending on area
-                    group.dynamic_brush_radius = job->brush_radius * std::max(1.5, std::min(4.0, area_coverage / 40.0));
+                    const double area = std::sqrt(point_count) * job->brush_radius;
+                    group.dynamic_brush_radius = job->brush_radius * std::max(2.0, std::min(5.0, area / 30.0));
                 }
                 
                 job->painter_current_group = 0;
@@ -7090,7 +7089,7 @@ namespace
                 job->painter_in_detail_pass = false;
                 
                 write_bridge_progress("painter_groups_ready",
-                                      "Undercoat done, starting rough pass",
+                                      "Starting rough pass with large brush",
                                       50, 100, job_elapsed_ms(),
                                       "\"groups\":" + std::to_string(job->painter_groups.size()));
                 
@@ -7099,45 +7098,50 @@ namespace
                 return;
             }
 
-            // Send points in batches with HUGE dominant-color brush
-            // Goal: complete in ~2 seconds
-            const int batch_size = std::max(5, job->server_batch_limit / 2);  // Send multiple per tick
-            const int count = std::max(1, std::min(batch_size,
-                                                   static_cast<int>(job->points.size()) - job->painter_current_batch));
-            std::vector<sdk::FPaintStroke> strokes{};
-            strokes.reserve(static_cast<std::size_t>(count));
+            // Undercoat: send points from stroke paths ONE PER TICK for smooth continuous effect
+            const auto& current_path = job->stroke_paths[static_cast<std::size_t>(job->stroke_path_index)];
+            const bool path_done = job->stroke_point_index >= static_cast<int>(current_path.size());
+
+            if (path_done)
+            {
+                ++job->stroke_path_index;
+                job->stroke_point_index = 0;
+                // Very short pause between strokes in undercoat
+                post_next_after(10);
+                return;
+            }
+
+            // Send ONE point per tick for continuous fluid undercoat strokes
+            const auto& pt = current_path[static_cast<std::size_t>(job->stroke_point_index)];
+            auto stroke_brush = job->brush;
+            stroke_brush.Radius = static_cast<float>(job->brush_radius * 6.0);  // HUGE brush
+            stroke_brush.Spacing = static_cast<float>(job->server_brush_spacing * 1.5);
             
             const double uc_r = job->painter_groups.empty() ? 0.5 : job->painter_groups[0].r;
             const double uc_g = job->painter_groups.empty() ? 0.5 : job->painter_groups[0].g;
             const double uc_b = job->painter_groups.empty() ? 0.5 : job->painter_groups[0].b;
             
-            for (int i = 0; i < count; ++i)
-            {
-                const auto& pt = job->points[static_cast<std::size_t>(job->painter_current_batch + i)];
-                auto stroke_brush = job->brush;
-                stroke_brush.Radius = static_cast<float>(job->brush_radius * 4.0);      // 4x for undercoat
-                stroke_brush.Spacing = static_cast<float>(job->server_brush_spacing * 2.0);
-                
-                const auto channel = sdk_make_channel(uc_r, uc_g, uc_b, pt.metallic, pt.roughness,
-                                                       sdk::EPaintChannelApplyMode::Override);
-                strokes.push_back(sdk_make_uv_stroke(pt.u, pt.v, channel, stroke_brush, sdk::EPaintChannel::Albedo));
-            }
+            const auto channel = sdk_make_channel(uc_r, uc_g, uc_b, pt.metallic, pt.roughness,
+                                                   sdk::EPaintChannelApplyMode::Override);
+            const std::vector<sdk::FPaintStroke> strokes{
+                sdk_make_uv_stroke(pt.u, pt.v, channel, stroke_brush, sdk::EPaintChannel::Albedo)
+            };
 
             SdkContext ctx{};
             ctx.component = job->component;
             ctx.server_paint_batch_function = job->server_paint_batch_function;
             std::string failure{};
-            if (!sdk_call_server_paint_batch(ctx, strokes, 0, strokes.size(), failure))
+            if (!sdk_call_server_paint_batch(ctx, strokes, 0, 1, failure))
             {
-                fail_job("painter_undercoat_failed", "Undercoat batch failed: " + failure);
+                fail_job("painter_undercoat_failed", "Undercoat failed: " + failure);
                 return;
             }
 
-            job->server_strokes_sent += count;
-            job->painter_current_batch += count;
+            job->server_strokes_sent++;
+            job->stroke_point_index++;
             
-            // Ultra-fast: 5ms between batches = 2 seconds total for all points
-            post_next_after(5);
+            // Fast: 10ms between points for smooth continuous undercoat
+            post_next_after(10);
             return;
         }
         case TemplateUvBrushAsyncJob::Phase::PainterThinkPause:
@@ -7272,10 +7276,10 @@ namespace
                 return;
             }
 
-            // Send one point with slightly reduced brush for detail (but still using dynamic radius)
+            // Send one point with smaller precise brush for detail
             const auto& pt = current_path[static_cast<std::size_t>(job->painter_current_batch)];
             std::string failure{};
-            const double detail_brush = group.dynamic_brush_radius * 0.7; // 70% of rough brush
+            const double detail_brush = group.dynamic_brush_radius * 0.5; // 50% of rough = small precise
             if (!painter_send_point_with_brush(job, pt, detail_brush, failure))
             {
                 fail_job("painter_detail_group_failed", "Detail group stroke failed: " + failure);
@@ -7283,8 +7287,8 @@ namespace
             }
             ++job->server_strokes_sent;
             ++job->painter_current_batch;
-            // Continuous stroke: 30ms between points
-            post_next_after(30);
+            // Slower for precision: 50ms between points instead of 30ms
+            post_next_after(50);
             return;
         }
         case TemplateUvBrushAsyncJob::Phase::ReplicateStrokes:
