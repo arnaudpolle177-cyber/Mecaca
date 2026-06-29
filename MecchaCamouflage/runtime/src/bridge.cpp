@@ -7077,6 +7077,18 @@ namespace
                     group.paths_rough = painter_build_stroke_paths(group.points_rough, max_gap_uv);
                     group.paths_detail = painter_build_stroke_paths(group.points_detail, max_gap_uv * 0.8);
                     
+                    // SORT paths by X coordinate (left to right) to paint one side then the other
+                    // This makes it look like a human painting, not symmetric chaos
+                    auto sort_by_x = [](const auto& a, const auto& b) {
+                        double avg_x_a = 0, avg_x_b = 0;
+                        for (const auto& pt : a) avg_x_a += pt.u;
+                        for (const auto& pt : b) avg_x_b += pt.u;
+                        return (avg_x_a / std::max(1.0, static_cast<double>(a.size()))) <
+                               (avg_x_b / std::max(1.0, static_cast<double>(b.size())));
+                    };
+                    std::sort(group.paths_rough.begin(), group.paths_rough.end(), sort_by_x);
+                    std::sort(group.paths_detail.begin(), group.paths_detail.end(), sort_by_x);
+                    
                     // Dynamic brush: VERY LARGE for rough pass
                     const int point_count = static_cast<int>(group.points_rough.size());
                     const double area = std::sqrt(point_count) * job->brush_radius;
@@ -7276,18 +7288,20 @@ namespace
                 return;
             }
 
-            // Send one point with smaller precise brush for detail
+            // Send one point with SMALL precise brush for detail (25% of rough)
             const auto& pt = current_path[static_cast<std::size_t>(job->painter_current_batch)];
             std::string failure{};
-            const double detail_brush = group.dynamic_brush_radius * 0.5; // 50% of rough = small precise
+            const double detail_brush = group.dynamic_brush_radius * 0.25; // 25% = small precise
             if (!painter_send_point_with_brush(job, pt, detail_brush, failure))
             {
-                fail_job("painter_detail_group_failed", "Detail group stroke failed: " + failure);
+                // Don't fail on detail errors, just skip
+                ++job->painter_current_batch;
+                post_next_after(50);
                 return;
             }
             ++job->server_strokes_sent;
             ++job->painter_current_batch;
-            // Slower for precision: 50ms between points instead of 30ms
+            // Slower for precision: 50ms between points
             post_next_after(50);
             return;
         }
