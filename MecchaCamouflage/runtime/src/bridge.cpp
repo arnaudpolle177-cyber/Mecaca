@@ -7228,7 +7228,23 @@ namespace
             ctx.component = job->component;
             ctx.server_paint_batch_function = job->server_paint_batch_function;
             std::string err;
-            sdk_call_server_paint_batch(ctx, strokes, 0, strokes.size(), err);
+            const bool sent = sdk_call_server_paint_batch(ctx, strokes, 0, strokes.size(), err);
+            
+            if (!sent)
+            {
+                ++job->server_batch_failures;
+                if (job->first_failure.empty())
+                {
+                    job->first_failure = err.empty() ? "ServerPaintBatch_failed" : err;
+                }
+            }
+            else
+            {
+                job->explicit_stroke_batch_used = true;
+                ++job->server_batch_success;
+                ++job->server_batch_calls;
+                job->server_strokes_sent += batch_count;
+            }
             
             job->painter_current_batch += batch_count;
             
