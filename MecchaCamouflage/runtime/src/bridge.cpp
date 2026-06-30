@@ -7113,7 +7113,9 @@ namespace
             const auto ch = sdk_make_channel(uc_r, uc_g, uc_b, pt.metallic, pt.roughness, sdk::EPaintChannelApplyMode::Override);
             std::vector<sdk::FPaintStroke> strokes{ sdk_make_uv_stroke(pt.u, pt.v, ch, brush, sdk::EPaintChannel::Albedo) };
             
-            SdkContext ctx{ job->component, job->server_paint_batch_function };
+            SdkContext ctx{};
+            ctx.component = job->component;
+            ctx.server_paint_batch_function = job->server_paint_batch_function;
             std::string err;
             sdk_call_server_paint_batch(ctx, strokes, 0, 1, err);
             
@@ -7186,7 +7188,9 @@ namespace
             const auto ch = sdk_make_channel(pt.r, pt.g, pt.b, pt.metallic, pt.roughness, sdk::EPaintChannelApplyMode::Override);
             std::vector<sdk::FPaintStroke> strokes{ sdk_make_uv_stroke(pt.u, pt.v, ch, brush, sdk::EPaintChannel::Albedo) };
             
-            SdkContext ctx{ job->component, job->server_paint_batch_function };
+            SdkContext ctx{};
+            ctx.component = job->component;
+            ctx.server_paint_batch_function = job->server_paint_batch_function;
             std::string err;
             sdk_call_server_paint_batch(ctx, strokes, 0, 1, err);
             
