@@ -18,6 +18,12 @@ namespace meccha
         bool painter_mode{false};
         int think_min_ms{1500};
         int think_max_ms{4000};
+        // Humanization
+        double jitter{0.0};
+        double pressure_randomize{0.0};
+        double color_humanize{0.0};
+        double spacing_randomize{0.0};
+        bool stroke_smoothing{false};
     };
 
     struct AppSettings
