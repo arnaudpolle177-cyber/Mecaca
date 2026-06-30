@@ -5462,6 +5462,7 @@ namespace
             std::vector<std::vector<TemplatePoint>> paths_rough{};
             std::vector<std::vector<TemplatePoint>> paths_detail{};
             double dynamic_brush_radius{0.01};  // Calculated based on group size and density
+            bool paths_built{false};  // lazy guard: paths are built/sorted exactly once
         };
         std::vector<ColorGroup> painter_groups{};
         int painter_current_group{0};
@@ -5820,9 +5821,25 @@ namespace
             paths.push_back(std::move(path));
         }
 
-        // Sort paths: longest first (big shapes before details)
+        // Order paths so painting reads as a natural top-to-bottom sweep instead of
+        // jumping between distant regions (e.g. forehead then shoes then forehead again).
+        // We bucket paths into horizontal bands by their centroid V, then within each
+        // band paint longest strokes first (big shapes before little ones), same as before.
+        constexpr double band_height = 0.12; // ~8 bands across the 0..1 UV range
+        auto path_centroid_v = [](const std::vector<PT>& path) -> double
+        {
+            double sum_v = 0.0;
+            for (const auto& pt : path) sum_v += pt.v;
+            return path.empty() ? 0.0 : sum_v / static_cast<double>(path.size());
+        };
         std::sort(paths.begin(), paths.end(),
-            [](const std::vector<PT>& a, const std::vector<PT>& b){ return a.size() > b.size(); });
+            [&](const std::vector<PT>& a, const std::vector<PT>& b)
+            {
+                const int band_a = static_cast<int>(path_centroid_v(a) / band_height);
+                const int band_b = static_cast<int>(path_centroid_v(b) / band_height);
+                if (band_a != band_b) return band_a < band_b;
+                return a.size() > b.size();
+            });
 
         return paths;
     }
@@ -7068,6 +7085,8 @@ namespace
                 
                 for (auto& group : job->painter_groups)
                 {
+                    if (group.paths_built) continue;  // lazy: never rebuild/re-sort an already-built group
+                    
                     // Sort points geographically: top-down, left-to-right
                     std::sort(group.points_rough.begin(), group.points_rough.end(),
                         [](const auto& a, const auto& b) {
@@ -7087,6 +7106,7 @@ namespace
                     // Dynamic brush: scale based on group coverage
                     const int count = static_cast<int>(group.points_rough.size());
                     group.dynamic_brush_radius = job->brush_radius * std::max(1.5, std::min(4.0, std::sqrt(count) / 20.0));
+                    group.paths_built = true;
                 }
                 
                 std::sort(job->painter_groups.begin(), job->painter_groups.end(),
@@ -7161,19 +7181,29 @@ namespace
                 }
             }
             
-            // Send points from current path one at a time for continuous strokes
+            // Send points from current path in small batches for continuous strokes.
+            // Batching cuts the number of server round-trips drastically while still
+            // looking hand-painted, since each batch is a short, spatially-contiguous run.
             const auto& path = paths[static_cast<std::size_t>(job->painter_current_path)];
             if (job->painter_current_batch >= static_cast<int>(path.size()))
             {
                 ++job->painter_current_path;
                 job->painter_current_batch = 0;
-                post_next_after(150);  // pause between strokes
+                // Short paths (detail flecks) need barely a pause; long paths (big shapes)
+                // deserve a believable "lift the brush" beat.
+                const int prev_path_len = static_cast<int>(path.size());
+                const int lift_delay = std::clamp(60 + prev_path_len * 6, 60, 150);
+                post_next_after(lift_delay);
                 return;
             }
             
-            const auto& pt = path[static_cast<std::size_t>(job->painter_current_batch)];
-            auto brush = job->brush;
+            const int remaining_in_path = static_cast<int>(path.size()) - job->painter_current_batch;
+            // 5-10 points per server call: smaller in detail pass (more precision-sensitive),
+            // larger in the rough pass (big strokes, fewer round-trips needed).
+            const int max_batch = job->painter_in_detail_pass ? 5 : 10;
+            const int batch_count = std::clamp(remaining_in_path, 1, max_batch);
             
+            auto brush = job->brush;
             if (!job->painter_in_detail_pass)
             {
                 // Rough: large brush
@@ -7185,17 +7215,30 @@ namespace
                 brush.Radius = static_cast<float>(group.dynamic_brush_radius * 0.2);
             }
             
-            const auto ch = sdk_make_channel(pt.r, pt.g, pt.b, pt.metallic, pt.roughness, sdk::EPaintChannelApplyMode::Override);
-            std::vector<sdk::FPaintStroke> strokes{ sdk_make_uv_stroke(pt.u, pt.v, ch, brush, sdk::EPaintChannel::Albedo) };
+            std::vector<sdk::FPaintStroke> strokes{};
+            strokes.reserve(static_cast<std::size_t>(batch_count));
+            for (int i = 0; i < batch_count; ++i)
+            {
+                const auto& pt = path[static_cast<std::size_t>(job->painter_current_batch + i)];
+                const auto ch = sdk_make_channel(pt.r, pt.g, pt.b, pt.metallic, pt.roughness, sdk::EPaintChannelApplyMode::Override);
+                strokes.push_back(sdk_make_uv_stroke(pt.u, pt.v, ch, brush, sdk::EPaintChannel::Albedo));
+            }
             
             SdkContext ctx{};
             ctx.component = job->component;
             ctx.server_paint_batch_function = job->server_paint_batch_function;
             std::string err;
-            sdk_call_server_paint_batch(ctx, strokes, 0, 1, err);
+            sdk_call_server_paint_batch(ctx, strokes, 0, strokes.size(), err);
             
-            ++job->painter_current_batch;
-            post_next_after(job->painter_in_detail_pass ? 60 : 30);  // slower for detail
+            job->painter_current_batch += batch_count;
+            
+            // Adaptive delay: base per-pass pacing, but a multi-point batch only needs a
+            // fraction of extra time per point (it's one round-trip, not N), so small batches
+            // wait almost nothing while large batches still feel like a continuous stroke.
+            const int base_delay = job->painter_in_detail_pass ? 60 : 30;
+            const double batch_factor = 1.0 + 0.35 * static_cast<double>(batch_count - 1);
+            const int adaptive_delay = std::max(8, static_cast<int>(base_delay * batch_factor / batch_count));
+            post_next_after(adaptive_delay);
             return;
         }
         case TemplateUvBrushAsyncJob::Phase::ReplicateStrokes:
