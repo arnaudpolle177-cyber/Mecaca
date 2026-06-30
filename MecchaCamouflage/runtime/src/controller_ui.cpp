@@ -617,89 +617,6 @@ namespace meccha
                     input_int_setting("Batch delay ms", tuning.server_batch_delay_ms, 1, 1000, paint_value_changed);
                     ImGui::EndDisabled();
                     ImGui::Separator();
-                    ImGui::TextDisabled("  Humanize");
-                    ImGui::BeginDisabled(!runtime.paint_editing);
-                    // Stroke Smoothing (checkbox)
-                    {
-                        ImGui::TableNextRow();
-                        ImGui::TableSetColumnIndex(0);
-                        ImGui::TextUnformatted("Stroke smoothing");
-                        ImGui::TableSetColumnIndex(1);
-                        bool smoothing = tuning.stroke_smoothing;
-                        if (ImGui::Checkbox("##stroke_smoothing", &smoothing))
-                        {
-                            tuning.stroke_smoothing = smoothing;
-                            paint_value_changed = true;
-                        }
-                        if (ImGui::IsItemHovered())
-                            ImGui::SetTooltip("Bézier interpolation between stroke points for smoother, more natural lines.");
-                    }
-                    // Jitter
-                    {
-                        float jitter_f = static_cast<float>(tuning.jitter);
-                        ImGui::TableNextRow();
-                        ImGui::TableSetColumnIndex(0);
-                        ImGui::TextUnformatted("Jitter");
-                        ImGui::TableSetColumnIndex(1);
-                        ImGui::SetNextItemWidth(-1.0f);
-                        if (ImGui::SliderFloat("##jitter", &jitter_f, 0.0f, 1.0f, "%.2f"))
-                        {
-                            tuning.jitter = static_cast<double>(jitter_f);
-                            paint_value_changed = true;
-                        }
-                        if (ImGui::IsItemHovered())
-                            ImGui::SetTooltip("UV position jitter per stroke (0=off, 1=max ~half radius). Breaks grid regularity.");
-                    }
-                    // Pressure Randomize
-                    {
-                        float pressure_f = static_cast<float>(tuning.pressure_randomize);
-                        ImGui::TableNextRow();
-                        ImGui::TableSetColumnIndex(0);
-                        ImGui::TextUnformatted("Pressure");
-                        ImGui::TableSetColumnIndex(1);
-                        ImGui::SetNextItemWidth(-1.0f);
-                        if (ImGui::SliderFloat("##pressure_randomize", &pressure_f, 0.0f, 1.0f, "%.2f"))
-                        {
-                            tuning.pressure_randomize = static_cast<double>(pressure_f);
-                            paint_value_changed = true;
-                        }
-                        if (ImGui::IsItemHovered())
-                            ImGui::SetTooltip("Random brush radius variation per stroke (0=off, 1=±40% of radius). Simulates hand pressure.");
-                    }
-                    // Color Humanize
-                    {
-                        float color_f = static_cast<float>(tuning.color_humanize);
-                        ImGui::TableNextRow();
-                        ImGui::TableSetColumnIndex(0);
-                        ImGui::TextUnformatted("Color noise");
-                        ImGui::TableSetColumnIndex(1);
-                        ImGui::SetNextItemWidth(-1.0f);
-                        if (ImGui::SliderFloat("##color_humanize", &color_f, 0.0f, 1.0f, "%.2f"))
-                        {
-                            tuning.color_humanize = static_cast<double>(color_f);
-                            paint_value_changed = true;
-                        }
-                        if (ImGui::IsItemHovered())
-                            ImGui::SetTooltip("Subtle random color variation per stroke (0=off, 1=±3% per channel). Avoids flat uniform regions.");
-                    }
-                    // Spacing Randomize
-                    {
-                        float spacing_f = static_cast<float>(tuning.spacing_randomize);
-                        ImGui::TableNextRow();
-                        ImGui::TableSetColumnIndex(0);
-                        ImGui::TextUnformatted("Spacing noise");
-                        ImGui::TableSetColumnIndex(1);
-                        ImGui::SetNextItemWidth(-1.0f);
-                        if (ImGui::SliderFloat("##spacing_randomize", &spacing_f, 0.0f, 1.0f, "%.2f"))
-                        {
-                            tuning.spacing_randomize = static_cast<double>(spacing_f);
-                            paint_value_changed = true;
-                        }
-                        if (ImGui::IsItemHovered())
-                            ImGui::SetTooltip("Random stroke spacing variation (0=off, 1=±50% of spacing). Breaks mechanical regularity.");
-                    }
-                    ImGui::EndDisabled();
-                    ImGui::Separator();
                     ImGui::TextDisabled("  Painter Mode");
                     ImGui::BeginDisabled(!runtime.paint_editing);
                     // Painter mode toggle
@@ -756,6 +673,18 @@ namespace meccha
                         actions.settings_changed = true;
                     }
                     ImGui::EndTable();
+                }
+
+                // Stop/Pause buttons when painting (shown instead of settings when not editing)
+                if (!runtime.paint_editing && runtime.bridge_ready)
+                {
+                    ImGui::Spacing();
+                    const float button_width = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2.0f;
+                    if (ImGui::Button("Pause", ImVec2(button_width, 0.0f)))
+                        actions.pause_paint_clicked = true;
+                    ImGui::SameLine();
+                    if (ImGui::Button("Stop", ImVec2(button_width, 0.0f)))
+                        actions.stop_paint_clicked = true;
                 }
 
                 settings_action_row(runtime.paint_editing,

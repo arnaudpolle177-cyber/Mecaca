@@ -30,6 +30,8 @@ namespace meccha
         bool cancel_paint_clicked{false};
         bool save_paint_clicked{false};
         bool reset_paint_clicked{false};
+        bool stop_paint_clicked{false};
+        bool pause_paint_clicked{false};
         bool open_logs_clicked{false};
         bool copy_log_clicked{false};
         bool copy_trace_clicked{false};
